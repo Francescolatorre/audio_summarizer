@@ -1,1 +1,4 @@
+# Ignore the DATA directory
+DATA/
 .env
+*.log

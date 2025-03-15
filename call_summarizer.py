@@ -5,9 +5,15 @@ import wave
 import numpy as np
 import pyaudio
 import tempfile
+import argparse
+import logging
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
+from tqdm import tqdm
+
+# Configure logging to write to a file
+logging.basicConfig(filename='call_summarizer.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load environment variables
 load_dotenv()
@@ -17,6 +23,9 @@ client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
     base_url=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 )
+
+DATA_DIR = "DATA"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 class CallSummarizer:
     def __init__(self):
@@ -41,14 +50,14 @@ class CallSummarizer:
                         input=True,
                         frames_per_buffer=self.chunk_size)
         
-        print("Recording started. Press Ctrl+C to stop recording...")
+        logging.info("Recording started. Press Ctrl+C to stop recording...")
         
         try:
             while self.recording:
                 data = stream.read(self.chunk_size)
                 self.audio_data.append(data)
         except KeyboardInterrupt:
-            print("Recording stopped.")
+            logging.info("Recording stopped.")
         finally:
             stream.stop_stream()
             stream.close()
@@ -62,12 +71,12 @@ class CallSummarizer:
     def save_audio(self, filename=None):
         """Save recorded audio to a WAV file"""
         if not self.audio_data:
-            print("No audio data to save")
+            logging.warning("No audio data to save")
             return None
             
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"call_recording_{timestamp}.wav"
+            filename = f"{DATA_DIR}/call_recording_{timestamp}.wav"
             
         wf = wave.open(filename, 'wb')
         wf.setnchannels(self.channels)
@@ -76,81 +85,202 @@ class CallSummarizer:
         wf.writeframes(b''.join(self.audio_data))
         wf.close()
         
-        print(f"Audio saved to {filename}")
+        logging.info(f"Audio saved to {filename}")
         return filename
     
-    def transcribe_audio(self, audio_file):
-        """Transcribe audio file to text using OpenAI's Whisper API"""
+    def validate_audio_file(self, file_path):
+        """Validate that the WAV file is correctly formatted"""
         try:
-            with open(audio_file, "rb") as audio:
-                transcript = client.audio.transcriptions.create(
-                    model=os.getenv("TRANSCRIPTION_MODEL", "whisper-1"),
-                    file=audio
-                )
-            return transcript.text
+            with wave.open(file_path, "rb") as wf:
+                # Check if the file has the correct number of channels and sample width
+                if wf.getnchannels() != self.channels or wf.getsampwidth() != pyaudio.PyAudio().get_sample_size(self.audio_format):
+                    logging.error(f"Invalid WAV file format: {file_path}")
+                    return False
+                logging.info(f"Valid WAV file: {file_path}")
+                return True
         except Exception as e:
-            print(f"Error transcribing audio: {e}")
-            print("If using LiteLLM, ensure it supports audio transcription")
+            logging.error(f"Error validating WAV file: {file_path}, Error: {e}")
+            return False
+    
+    def check_llm_availability(self):
+        """Check the availability of the configured LLM"""
+        try:
+            # Make a simple API call to check availability
+            client.models.list()
+            logging.info("LLM is available.")
+            return True
+        except Exception as e:
+            logging.error(f"Error checking LLM availability: {e}")
+            return False
+    
+    def transcribe_audio(self, audio_file, chunk_duration=10, total_duration=None, keep_temp_files=False):
+        """Transcribe audio file to text using OpenAI's Whisper API"""
+        if not self.validate_audio_file(audio_file):
+            logging.error("Transcription aborted due to audio file issues.")
+            return None
+        
+        try:
+            with wave.open(audio_file, "rb") as wf:
+                total_frames = wf.getnframes()
+                frame_rate = wf.getframerate()
+                chunk_size = frame_rate * chunk_duration
+                if total_duration:
+                    total_frames = min(total_frames, frame_rate * total_duration)
+                transcript = []
+
+                for start in tqdm(range(0, total_frames, chunk_size), desc="Chunking"):
+                    wf.setpos(start)
+                    frames = wf.readframes(chunk_size)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:
+                        temp_wav_name = temp_wav.name
+                        # Write frames to a valid WAV file format
+                        with wave.open(temp_wav_name, "wb") as temp_wav_file:
+                            temp_wav_file.setnchannels(self.channels)
+                            temp_wav_file.setsampwidth(pyaudio.PyAudio().get_sample_size(self.audio_format))
+                            temp_wav_file.setframerate(frame_rate)
+                            temp_wav_file.writeframes(frames)
+
+                    # Validate the temporary WAV file
+                    if not self.validate_audio_file(temp_wav_name):
+                        logging.warning("Skipping invalid chunk.")
+                        continue
+
+                    retries = 3
+                    for attempt in range(retries):
+                        try:
+                            with open(temp_wav_name, "rb") as audio:
+                                chunk_transcript = client.audio.transcriptions.create(
+                                    model=os.getenv("TRANSCRIPTION_MODEL", "whisper-1"),
+                                    file=audio
+                                )
+                            transcript.append(chunk_transcript.text)
+                            break
+                        except Exception as e:
+                            logging.error(f"Error transcribing chunk: {e}")
+                            if attempt < retries - 1:
+                                logging.info("Retrying...")
+                                time.sleep(2)  # Wait before retrying
+                    if not keep_temp_files:
+                        os.remove(temp_wav_name)
+
+            return " ".join(transcript)
+        except Exception as e:
+            logging.error(f"Error processing audio file: {e}")
             return None
     
     def summarize_text(self, text):
         """Generate a summary of the transcribed text using OpenAI API"""
         if not text:
             return "No text to summarize"
-            
-        try:
-            model = os.getenv("SUMMARY_MODEL", "gpt-3.5-turbo")
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that summarizes phone calls. Create a concise summary of the key points, action items, and important information from the conversation."},
-                    {"role": "user", "content": f"Please summarize the following phone call transcript:\n\n{text}"}
-                ]
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error generating summary: {e}")
-            return "Failed to generate summary."
+        
+        retries = 3
+        for attempt in range(retries):
+            try:
+                model = os.getenv("SUMMARY_MODEL", "gpt-3.5-turbo")
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that summarizes phone calls. Create a concise summary of the key points, action items, and important information from the conversation."},
+                        {"role": "user", "content": f"Please summarize the following phone call transcript:\n\n{text}"}
+                    ]
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                logging.error(f"Error generating summary: {e}")
+                if attempt < retries - 1:
+                    logging.info("Retrying...")
+                    time.sleep(2)  # Wait before retrying
+        return "Failed to generate summary."
     
-    def process_call(self):
+    def process_call(self, audio_file=None, verbose=False, chunk_duration=10, total_duration=None, keep_temp_files=False):
         """Record, transcribe, and summarize a call"""
         try:
-            self.start_recording()
+            if not self.check_llm_availability():
+                logging.error("LLM is not available. Please check your configuration.")
+                return
+            
+            if audio_file:
+                logging.info(f"Analyzing provided audio file: {audio_file}")
+            else:
+                try:
+                    self.start_recording()
+                except KeyboardInterrupt:
+                    logging.info("Recording interrupted.")
+                    return
+                audio_file = self.save_audio()
+                if not audio_file:
+                    return
+            logging.info("Transcribing audio...")
+            transcript = self.transcribe_audio(audio_file, chunk_duration, total_duration, keep_temp_files)
+            if not transcript:
+                logging.error("Transcription failed.")
+                return
+            
+            # Print transcript only if verbose flag is set
+            if verbose:
+                logging.info("\nTranscript:\n")
+                logging.info(transcript)
+            
+            # Save transcript to a Markdown file with the prefix "Transcript"
+            transcript_md_filename = os.path.join(DATA_DIR, os.path.splitext(os.path.basename(audio_file))[0] + "_Transcript.md")
+            with open(transcript_md_filename, "w") as md_file:
+                md_file.write("# Call Transcript\n\n")
+                md_file.write(transcript)
+            logging.info(f"Transcript saved to {transcript_md_filename}")
+            
+            logging.info("\nGenerating summary...\n")
+            summary = self.summarize_text(transcript)
+            
+            logging.info("\nCall Summary:\n")
+            logging.info(summary)
+            
+            # Save summary to a Markdown file with the prefix "Summary"
+            summary_md_filename = os.path.join(DATA_DIR, os.path.splitext(os.path.basename(audio_file))[0] + "_Summary.md")
+            with open(summary_md_filename, "w") as md_file:
+                md_file.write("# Call Summary\n\n")
+                md_file.write(summary)
+            logging.info(f"Summary saved to {summary_md_filename}")
+            
+            return {
+                "audio_file": audio_file,
+                "transcript": transcript,
+                "summary": summary
+            }
         except KeyboardInterrupt:
-            pass
-        
-        audio_file = self.save_audio()
-        if not audio_file:
+            logging.info("Process interrupted.")
             return
-            
-        print("Transcribing audio...")
-        transcript = self.transcribe_audio(audio_file)
-        if not transcript:
-            print("Transcription failed.")
-            return
-            
-        print("\nTranscript:")
-        print(transcript)
-        
-        print("\nGenerating summary...")
-        summary = self.summarize_text(transcript)
-        
-        print("\nCall Summary:")
-        print(summary)
-        
-        return {
-            "audio_file": audio_file,
-            "transcript": transcript,
-            "summary": summary
-        }
+
+def display_help():
+    """Display help information for the CLI"""
+    help_text = """
+    Usage: python call_summarizer.py [options] <path_to_wav_file>
+
+    Options:
+      --help                  Show this help message and exit
+      --verbose               Print transcript to console
+      --chunk_duration=<sec>  Specify chunk duration for transcription (default: 10 seconds)
+      --total_duration=<sec>  Specify total duration of call snippet to transcribe
+      --debug                 Keep temporary WAV files during development
+
+    Examples:
+      python call_summarizer.py ./DATA/call1.wav --verbose
+      python call_summarizer.py ./DATA/call1.wav --chunk_duration=60 --total_duration=300 --debug
+    """
+    logging.info(help_text)
 
 def main():
-    print("Call Summarizer - Record and summarize your calls")
-    print("Make sure you have set your OPENAI_API_KEY in a .env file")
-    print("Press Ctrl+C to stop recording")
+    logging.info("Call Summarizer - Record and summarize your calls")
     
     summarizer = CallSummarizer()
-    summarizer.process_call()
+    parser = argparse.ArgumentParser(description='Call Summarizer - Record and summarize your calls')
+    parser.add_argument('audio_file', nargs='?', help='Path to the WAV file')
+    parser.add_argument('--verbose', action='store_true', help='Print transcript to console')
+    parser.add_argument('--chunk_duration', type=int, default=10, help='Specify chunk duration for transcription (default: 10 seconds)')
+    parser.add_argument('--total_duration', type=int, help='Specify total duration of call snippet to transcribe')
+    parser.add_argument('--debug', action='store_true', help='Keep temporary WAV files during development')
+    args = parser.parse_args()
+
+    summarizer.process_call(args.audio_file, args.verbose, args.chunk_duration, args.total_duration, args.debug)
 
 if __name__ == "__main__":
     main()
