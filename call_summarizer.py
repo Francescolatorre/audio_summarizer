@@ -51,13 +51,24 @@ class CallSummarizer:
                         frames_per_buffer=self.chunk_size)
         
         logging.info("Recording started. Press Ctrl+C to stop recording...")
+        print("Recording started. Press Ctrl+C to stop recording...")
+
+        start_time = time.time()
         
         try:
             while self.recording:
                 data = stream.read(self.chunk_size)
                 self.audio_data.append(data)
+                
+                # Calculate elapsed time
+                elapsed_time = time.time() - start_time
+                minutes, seconds = divmod(int(elapsed_time), 60)
+                print(f"\rRecording... {minutes}m {seconds}s elapsed. Press Ctrl+C to stop.", end="")
+                
+                time.sleep(1)  # Update every second
         except KeyboardInterrupt:
             logging.info("Recording stopped.")
+            print("\nRecording stopped.")
         finally:
             stream.stop_stream()
             stream.close()
@@ -227,6 +238,7 @@ class CallSummarizer:
                 md_file.write("# Call Transcript\n\n")
                 md_file.write(transcript)
             logging.info(f"Transcript saved to {transcript_md_filename}")
+            print(f"Transcript saved to {transcript_md_filename}")
             
             logging.info("\nGenerating summary...\n")
             summary = self.summarize_text(transcript)
@@ -240,6 +252,7 @@ class CallSummarizer:
                 md_file.write("# Call Summary\n\n")
                 md_file.write(summary)
             logging.info(f"Summary saved to {summary_md_filename}")
+            print(f"Summary saved to {summary_md_filename}")
             
             return {
                 "audio_file": audio_file,
