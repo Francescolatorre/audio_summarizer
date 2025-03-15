@@ -7,6 +7,7 @@ import pyaudio
 import tempfile
 import argparse
 import logging
+import random
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -31,6 +32,7 @@ class CallSummarizer:
     def __init__(self):
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
+        self.p = pyaudio.PyAudio()  # Store instance globally
         self.recording = False
         self.audio_data = []
         self.sample_rate = 16000
@@ -43,12 +45,11 @@ class CallSummarizer:
         self.recording = True
         self.audio_data = []
         
-        p = pyaudio.PyAudio()
-        stream = p.open(format=self.audio_format,
-                        channels=self.channels,
-                        rate=self.sample_rate,
-                        input=True,
-                        frames_per_buffer=self.chunk_size)
+        stream = self.p.open(format=self.audio_format,
+                             channels=self.channels,
+                             rate=self.sample_rate,
+                             input=True,
+                             frames_per_buffer=self.chunk_size)
         
         logging.info("Recording started. Press Ctrl+C to stop recording...")
         print("Recording started. Press Ctrl+C to stop recording...")
@@ -72,12 +73,12 @@ class CallSummarizer:
         finally:
             stream.stop_stream()
             stream.close()
-            p.terminate()
-            self.recording = False
+            self.stop_recording()
             
     def stop_recording(self):
         """Stop recording audio"""
         self.recording = False
+        self.p.terminate()  # Ensures it's always closed
         
     def save_audio(self, filename=None):
         """Save recorded audio to a WAV file"""
@@ -87,7 +88,7 @@ class CallSummarizer:
             
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{DATA_DIR}/call_recording_{timestamp}.wav"
+            filename = os.path.join(DATA_DIR, f"call_recording_{timestamp}.wav")
             
         wf = wave.open(filename, 'wb')
         wf.setnchannels(self.channels)
@@ -110,7 +111,7 @@ class CallSummarizer:
                 logging.info(f"Valid WAV file: {file_path}")
                 return True
         except Exception as e:
-            logging.error(f"Error validating WAV file: {file_path}, Error: {e}")
+            logging.exception(f"Error validating WAV file: {file_path}")
             return False
     
     def check_llm_availability(self):
@@ -121,7 +122,7 @@ class CallSummarizer:
             logging.info("LLM is available.")
             return True
         except Exception as e:
-            logging.error(f"Error checking LLM availability: {e}")
+            logging.exception("Error checking LLM availability")
             return False
     
     def transcribe_audio(self, audio_file, chunk_duration=10, total_duration=None, keep_temp_files=False):
@@ -129,6 +130,13 @@ class CallSummarizer:
         if not self.validate_audio_file(audio_file):
             logging.error("Transcription aborted due to audio file issues.")
             return None
+        
+        def clean_transcript(transcript):
+            """Cleans up Whisper transcription by removing filler words and noise markers."""
+            transcript = transcript.replace("[inaudible]", "").replace("[background noise]", "")
+            transcript = transcript.replace("uh", "").replace("um", "")  # Remove fillers (optional)
+            return transcript.strip()
+        
         
         try:
             with wave.open(audio_file, "rb") as wf:
@@ -164,25 +172,34 @@ class CallSummarizer:
                                     model=os.getenv("TRANSCRIPTION_MODEL", "whisper-1"),
                                     file=audio
                                 )
-                            transcript.append(chunk_transcript.text)
+                            if chunk_transcript.text:
+                                transcript.append(chunk_transcript.text)
                             break
                         except Exception as e:
-                            logging.error(f"Error transcribing chunk: {e}")
+                            logging.exception("Error transcribing chunk")
                             if attempt < retries - 1:
-                                logging.info("Retrying...")
-                                time.sleep(2)  # Wait before retrying
+                                sleep_time = min(5, (2 ** attempt) + random.uniform(0, 1))
+                                logging.info(f"Retrying in {sleep_time:.2f} seconds...")
+                                time.sleep(sleep_time)
                     if not keep_temp_files:
                         os.remove(temp_wav_name)
 
-            return " ".join(transcript)
+            final_transcript = clean_transcript(" ".join(transcript))
+            return final_transcript
         except Exception as e:
-            logging.error(f"Error processing audio file: {e}")
+            logging.exception("Error processing audio file")
             return None
     
     def summarize_text(self, text):
         """Generate a summary of the transcribed text using OpenAI API"""
         if not text:
             return "No text to summarize"
+        
+        verbosity = os.getenv("SUMMARY_VERBOSITY", "detailed")  # Default to detailed
+        if verbosity == "short":
+            system_prompt = "Summarize phone calls into 3 bullet points. Focus only on decisions and action items."
+        else:
+            system_prompt = "Summarize phone calls into key points using bullet points. Highlight action items, decisions, and important topics. Keep it clear and concise."
         
         retries = 3
         for attempt in range(retries):
@@ -191,16 +208,17 @@ class CallSummarizer:
                 response = client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": "You are a helpful assistant that summarizes phone calls. Create a concise summary of the key points, action items, and important information from the conversation."},
-                        {"role": "user", "content": f"Please summarize the following phone call transcript:\n\n{text}"}
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Summarize this phone call:\n\n{text}\n\n### Summary:"}
                     ]
                 )
                 return response.choices[0].message.content
             except Exception as e:
-                logging.error(f"Error generating summary: {e}")
+                logging.exception("Error generating summary")
                 if attempt < retries - 1:
-                    logging.info("Retrying...")
-                    time.sleep(2)  # Wait before retrying
+                    sleep_time = min(5, (2 ** attempt) + random.uniform(0, 1))
+                    logging.info(f"Retrying in {sleep_time:.2f} seconds...")
+                    time.sleep(sleep_time)
         return "Failed to generate summary."
     
     def process_call(self, audio_file=None, verbose=False, chunk_duration=10, total_duration=None, keep_temp_files=False):
@@ -254,6 +272,8 @@ class CallSummarizer:
             logging.info(f"Summary saved to {summary_md_filename}")
             print(f"Summary saved to {summary_md_filename}")
             
+            print(f"Files created:\nTranscript: {transcript_md_filename}\nSummary: {summary_md_filename}")
+            
             return {
                 "audio_file": audio_file,
                 "transcript": transcript,
@@ -288,9 +308,10 @@ def main():
     parser = argparse.ArgumentParser(description='Call Summarizer - Record and summarize your calls')
     parser.add_argument('audio_file', nargs='?', help='Path to the WAV file')
     parser.add_argument('--verbose', action='store_true', help='Print transcript to console')
-    parser.add_argument('--chunk_duration', type=int, default=10, help='Specify chunk duration for transcription (default: 10 seconds)')
+    parser.add_argument('--chunk_duration', type=int, help='Specify chunk duration for transcription')
     parser.add_argument('--total_duration', type=int, help='Specify total duration of call snippet to transcribe')
     parser.add_argument('--debug', action='store_true', help='Keep temporary WAV files during development')
+    parser.set_defaults(chunk_duration=10)  # Default value for chunk_duration
     args = parser.parse_args()
 
     summarizer.process_call(args.audio_file, args.verbose, args.chunk_duration, args.total_duration, args.debug)
