@@ -2,3 +2,5 @@
 DATA/
 .env
 *.log
+*.pyc
+test_call_summarizer.py

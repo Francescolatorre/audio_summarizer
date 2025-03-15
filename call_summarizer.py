@@ -156,7 +156,7 @@ class CallSummarizer:
                         with wave.open(temp_wav_name, "wb") as temp_wav_file:
                             temp_wav_file.setnchannels(self.channels)
                             temp_wav_file.setsampwidth(pyaudio.PyAudio().get_sample_size(self.audio_format))
-                            temp_wav_file.setframerate(frame_rate)
+                            temp_wav_file.setframerate(self.sample_rate)  # Enforce correct rate
                             temp_wav_file.writeframes(frames)
 
                     # Validate the temporary WAV file
@@ -221,6 +221,23 @@ class CallSummarizer:
                     time.sleep(sleep_time)
         return "Failed to generate summary."
     
+    def summarize_large_text(self, text, max_chunk_size=3000):
+        """Breaks long transcripts into smaller parts, summarizes each, and then summarizes all summaries."""
+        chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
+        summaries = []
+        
+        for chunk in chunks:
+            messages = [
+                {"role": "system", "content": "Summarize this conversation clearly, highlighting key points, decisions, and action items."},
+                {"role": "user", "content": f"Summarize this part:\n\n{chunk}\n\n### Summary:"}
+            ]
+            response = client.chat.completions.create(model="gpt-4o", messages=messages)
+            summaries.append(response.choices[0].message.content)
+
+        # Final summary of all summaries
+        final_summary = self.summarize_text(" ".join(summaries))
+        return final_summary
+    
     def process_call(self, audio_file=None, verbose=False, chunk_duration=10, total_duration=None, keep_temp_files=False):
         """Record, transcribe, and summarize a call"""
         try:
@@ -258,8 +275,8 @@ class CallSummarizer:
             logging.info(f"Transcript saved to {transcript_md_filename}")
             print(f"Transcript saved to {transcript_md_filename}")
             
-            logging.info("\nGenerating summary...\n")
-            summary = self.summarize_text(transcript)
+            logging.info("\nGenerating hierarchical summary...\n")
+            summary = self.summarize_large_text(transcript)
             
             logging.info("\nCall Summary:\n")
             logging.info(summary)
@@ -298,6 +315,8 @@ def display_help():
     Examples:
       python call_summarizer.py ./DATA/call1.wav --verbose
       python call_summarizer.py ./DATA/call1.wav --chunk_duration=60 --total_duration=300 --debug
+
+    Note: The summarization process now uses hierarchical summarization to handle long transcripts effectively.
     """
     logging.info(help_text)
 
