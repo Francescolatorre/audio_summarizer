@@ -8,6 +8,8 @@ An application that records audio from your microphone, transcribes it, and gene
 - Transcribe audio using OpenAI's Whisper API
 - Generate concise summaries of call content using OpenAI's GPT model
 - Save recordings for future reference
+- Validate audio files for correct format
+- Hierarchical summarization for long transcripts
 
 ## Requirements
 
@@ -35,7 +37,7 @@ An application that records audio from your microphone, transcribes it, and gene
    SUMMARY_MODEL=gpt-3.5-turbo
    TRANSCRIPTION_MODEL=whisper-1
    ```
-   
+
    If using the official OpenAI API, you can omit the `OPENAI_API_BASE` variable.
 
 ## Usage
@@ -50,12 +52,14 @@ python call_summarizer.py
 - The application will transcribe the audio and generate a summary
 - Both the transcript and summary will be displayed in the console
 - The audio recording is saved to a file with a timestamp
+- Transcripts and summaries are saved as Markdown files
 
 ## Notes
 
 - This application requires a working microphone and internet connection
 - The quality of transcription and summary depends on audio quality
 - OpenAI API usage will incur costs based on your OpenAI account
+- Ensure the `.env` file is correctly configured for API access
 
 ## License
 
